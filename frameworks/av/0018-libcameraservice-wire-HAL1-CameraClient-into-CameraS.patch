@@ -1,0 +1,474 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Mon, 5 Oct 2026 12:22:28 +0200
+Subject: [PATCH 18/22] libcameraservice: wire HAL1 CameraClient into
+ CameraService and flashlight
+
+makeClient() creates a CameraClient for CAMERA_DEVICE_API_VERSION_1_0 when the
+Camera API1 is used (API2 still gets ERROR_DEPRECATED_HAL). Restore
+CameraHardwareInterfaceFlashControl, the preview-based torch emulation used when
+the provider does not support setTorchMode, replacing the removed GLConsumer
+sink by a BufferItemConsumer. Add the new sources to Android.bp and let
+CameraClient reach CameraService::mActiveClientManager.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Change-Id: Idf38a5b1847d223b1877582552bf9ba624f8a1a4
+Signed-off-by: Herman van Hazendonk <github.com@herrie.org>
+---
+ services/camera/libcameraservice/Android.bp   |   2 +
+ .../libcameraservice/CameraFlashlight.cpp     | 282 +++++++++++++++++-
+ .../libcameraservice/CameraFlashlight.h       |  57 ++++
+ .../camera/libcameraservice/CameraService.cpp |  20 +-
+ .../camera/libcameraservice/CameraService.h   |   1 +
+ 5 files changed, 356 insertions(+), 6 deletions(-)
+
+diff --git a/services/camera/libcameraservice/Android.bp b/services/camera/libcameraservice/Android.bp
+index f9cbc0e6d8..3f2d4e1c21 100644
+--- a/services/camera/libcameraservice/Android.bp
++++ b/services/camera/libcameraservice/Android.bp
+@@ -148,6 +148,8 @@ cc_library {
+         "config/SharedSessionConfigUtils.cpp",
+         "config/SharedSessionConfigReader.cpp",
+         "api1/Camera2Client.cpp",
++        "api1/CameraClient.cpp",
++        "device1/CameraHardwareInterface.cpp",
+         "api1/client2/Parameters.cpp",
+         "api1/client2/FrameProcessor.cpp",
+         "api1/client2/StreamingProcessor.cpp",
+diff --git a/services/camera/libcameraservice/CameraFlashlight.cpp b/services/camera/libcameraservice/CameraFlashlight.cpp
+index d21241b843..2668d5d05b 100644
+--- a/services/camera/libcameraservice/CameraFlashlight.cpp
++++ b/services/camera/libcameraservice/CameraFlashlight.cpp
+@@ -22,6 +22,8 @@
+ #include <utils/Trace.h>
+ #include <cutils/properties.h>
+ 
++#include <tuple>
++#include <ui/GraphicBuffer.h>
+ #include "CameraFlashlight.h"
+ #include "camera/CameraMetadata.h"
+ #include "camera/camera2/CaptureRequest.h"
+@@ -53,8 +55,10 @@ status_t CameraFlashlight::createFlashlightControl(const std::string& cameraId)
+     if (mProviderManager->supportSetTorchMode(cameraId)) {
+         mFlashControl = new ProviderFlashControl(mProviderManager);
+     } else {
+-        ALOGE("Flashlight control not supported by this device!");
+-        return NO_INIT;
++        // Only HAL1 devices do not support setTorchMode; torch is emulated by opening the
++        // camera and starting a preview with FLASH_MODE_TORCH.
++        mFlashControl =
++                new CameraHardwareInterfaceFlashControl(mProviderManager, mCallbacks);
+     }
+ 
+     return OK;
+@@ -369,4 +373,278 @@ status_t ProviderFlashControl::getTorchStrengthLevel(const std::string& cameraId
+ }
+ // ProviderFlashControl implementation ends
+ 
++// Restored from the Android 11 tree (LineageOS lineage-18.1) for HAL1 devices.
++/////////////////////////////////////////////////////////////////////
++// CameraHardwareInterfaceFlashControl implementation begins
++// Flash control for camera module <= v2.3 and camera HAL v1
++/////////////////////////////////////////////////////////////////////
++
++CameraHardwareInterfaceFlashControl::CameraHardwareInterfaceFlashControl(
++        sp<CameraProviderManager> manager,
++        CameraProviderManager::StatusListener* callbacks) :
++        mProviderManager(manager),
++        mCallbacks(callbacks),
++        mTorchEnabled(false) {
++}
++
++CameraHardwareInterfaceFlashControl::~CameraHardwareInterfaceFlashControl() {
++    disconnectCameraDevice();
++
++    mSurface.clear();
++    mSurfaceTexture.clear();
++
++    if (mTorchEnabled) {
++        if (mCallbacks) {
++            ALOGV("%s: notify the framework that torch was turned off",
++                    __FUNCTION__);
++            mCallbacks->onTorchStatusChanged(mCameraId, TorchModeStatus::AVAILABLE_OFF);
++        }
++    }
++}
++
++status_t CameraHardwareInterfaceFlashControl::setTorchMode(
++        const std::string& cameraId, bool enabled) {
++    Mutex::Autolock l(mLock);
++
++    // pre-check
++    status_t res;
++    if (enabled) {
++        bool hasFlash = false;
++        // Check if it has a flash unit and leave camera device open.
++        res = hasFlashUnitLocked(cameraId, &hasFlash, /*keepDeviceOpen*/true);
++        // invalid camera?
++        if (res) {
++            // hasFlashUnitLocked() returns BAD_INDEX if mDevice is connected to
++            // another camera device.
++            return res == BAD_INDEX ? BAD_INDEX : -EINVAL;
++        }
++        // no flash unit?
++        if (!hasFlash) {
++            // Disconnect camera device if it has no flash.
++            disconnectCameraDevice();
++            return -ENOSYS;
++        }
++    } else if (mDevice == NULL || cameraId != mCameraId) {
++        // disabling the torch mode of an un-opened or different device.
++        return OK;
++    } else {
++        // disabling the torch mode of currently opened device
++        disconnectCameraDevice();
++        mTorchEnabled = false;
++        mCallbacks->onTorchStatusChanged(cameraId, TorchModeStatus::AVAILABLE_OFF);
++        return OK;
++    }
++
++    res = startPreviewAndTorch();
++    if (res) {
++        return res;
++    }
++
++    mTorchEnabled = true;
++    mCallbacks->onTorchStatusChanged(cameraId, TorchModeStatus::AVAILABLE_ON);
++    return OK;
++}
++
++status_t CameraHardwareInterfaceFlashControl::hasFlashUnit(
++        const std::string& cameraId, bool *hasFlash) {
++    Mutex::Autolock l(mLock);
++    // Close device after checking if it has a flash unit.
++    return hasFlashUnitLocked(cameraId, hasFlash, /*keepDeviceOpen*/false);
++}
++
++status_t CameraHardwareInterfaceFlashControl::hasFlashUnitLocked(
++        const std::string& cameraId, bool *hasFlash, bool keepDeviceOpen) {
++    bool closeCameraDevice = false;
++
++    if (!hasFlash) {
++        return BAD_VALUE;
++    }
++
++    status_t res;
++    if (mDevice == NULL) {
++        // Connect to camera device to query if it has a flash unit.
++        res = connectCameraDevice(cameraId);
++        if (res) {
++            return res;
++        }
++        // Close camera device only when it is just opened and the caller doesn't want to keep
++        // the camera device open.
++        closeCameraDevice = !keepDeviceOpen;
++    }
++
++    if (cameraId != mCameraId) {
++        return BAD_INDEX;
++    }
++
++    const char *flashMode =
++            mParameters.get(CameraParameters::KEY_SUPPORTED_FLASH_MODES);
++    if (flashMode && strstr(flashMode, CameraParameters::FLASH_MODE_TORCH)) {
++        *hasFlash = true;
++    } else {
++        *hasFlash = false;
++    }
++
++    if (closeCameraDevice) {
++        res = disconnectCameraDevice();
++        if (res != OK) {
++            ALOGE("%s: Failed to disconnect camera device. %s (%d)", __FUNCTION__,
++                    strerror(-res), res);
++            return res;
++        }
++    }
++
++    return OK;
++}
++
++status_t CameraHardwareInterfaceFlashControl::turnOnTorchWithStrengthLevel(
++        const std::string& /*cameraId*/, int32_t /*torchStrength*/) {
++    return INVALID_OPERATION;
++}
++
++status_t CameraHardwareInterfaceFlashControl::getTorchStrengthLevel(
++        const std::string& /*cameraId*/, int32_t* /*torchStrength*/) {
++    return INVALID_OPERATION;
++}
++
++status_t CameraHardwareInterfaceFlashControl::startPreviewAndTorch() {
++    status_t res = OK;
++    res = mDevice->startPreview();
++    if (res) {
++        ALOGE("%s: start preview failed. %s (%d)", __FUNCTION__,
++                strerror(-res), res);
++        return res;
++    }
++
++    mParameters.set(CameraParameters::KEY_FLASH_MODE,
++            CameraParameters::FLASH_MODE_TORCH);
++
++    return mDevice->setParameters(mParameters);
++}
++
++status_t CameraHardwareInterfaceFlashControl::getSmallestSurfaceSize(
++        int32_t *width, int32_t *height) {
++    if (!width || !height) {
++        return BAD_VALUE;
++    }
++
++    int32_t w = INT32_MAX;
++    int32_t h = 1;
++    Vector<Size> sizes;
++
++    mParameters.getSupportedPreviewSizes(sizes);
++    for (size_t i = 0; i < sizes.size(); i++) {
++        Size s = sizes[i];
++        if (w * h > s.width * s.height) {
++            w = s.width;
++            h = s.height;
++        }
++    }
++
++    if (w == INT32_MAX) {
++        return NAME_NOT_FOUND;
++    }
++
++    *width = w;
++    *height = h;
++
++    return OK;
++}
++
++status_t CameraHardwareInterfaceFlashControl::initializePreviewWindow(
++        const sp<CameraHardwareInterface>& device, int32_t width, int32_t height) {
++    status_t res;
++    // GLConsumer can no longer be constructed outside libgui; the torch preview only needs a
++    // sink that keeps the producer side happy, so use a BufferItemConsumer with an
++    // app-controlled (async) surface instead.
++    std::tie(mSurfaceTexture, mSurface) = BufferItemConsumer::create(
++            GraphicBuffer::USAGE_HW_TEXTURE, BufferItemConsumer::DEFAULT_MAX_BUFFERS,
++            /*controlledByApp*/ true);
++    if (mSurfaceTexture == NULL || mSurface == NULL) {
++        return NO_MEMORY;
++    }
++
++    int32_t format = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
++    res = mSurfaceTexture->setDefaultBufferSize(width, height);
++    if (res) {
++        return res;
++    }
++    res = mSurfaceTexture->setDefaultBufferFormat(format);
++    if (res) {
++        return res;
++    }
++
++    res = native_window_api_connect(mSurface.get(), NATIVE_WINDOW_API_CAMERA);
++    if (res) {
++        ALOGE("%s: Unable to connect to native window", __FUNCTION__);
++        return res;
++    }
++
++    return device->setPreviewWindow(mSurface);
++}
++
++status_t CameraHardwareInterfaceFlashControl::connectCameraDevice(
++        const std::string& cameraId) {
++    sp<CameraHardwareInterface> device =
++            new CameraHardwareInterface(cameraId.c_str());
++
++    status_t res = device->initialize(mProviderManager);
++    if (res) {
++        ALOGE("%s: initializing camera %s failed", __FUNCTION__,
++                cameraId.c_str());
++        return res;
++    }
++
++    // need to set __get_memory in set_callbacks().
++    device->setCallbacks(NULL, NULL, NULL, NULL, NULL);
++
++    mParameters = device->getParameters();
++
++    int32_t width, height;
++    res = getSmallestSurfaceSize(&width, &height);
++    if (res) {
++        ALOGE("%s: failed to get smallest surface size for camera %s",
++                __FUNCTION__, cameraId.c_str());
++        return res;
++    }
++
++    res = initializePreviewWindow(device, width, height);
++    if (res) {
++        ALOGE("%s: failed to initialize preview window for camera %s",
++                __FUNCTION__, cameraId.c_str());
++        return res;
++    }
++
++    mCameraId = cameraId;
++    mDevice = device;
++    return OK;
++}
++
++status_t CameraHardwareInterfaceFlashControl::disconnectCameraDevice() {
++    if (mDevice == NULL) {
++        return OK;
++    }
++
++    if (mParameters.get(CameraParameters::KEY_FLASH_MODE)) {
++        // There is a flash, turn if off.
++        // (If there isn't one, leave the parameter null)
++        mParameters.set(CameraParameters::KEY_FLASH_MODE,
++                CameraParameters::FLASH_MODE_OFF);
++        mDevice->setParameters(mParameters);
++    }
++    mDevice->stopPreview();
++    status_t res = native_window_api_disconnect(mSurface.get(),
++            NATIVE_WINDOW_API_CAMERA);
++    if (res) {
++        ALOGW("%s: native_window_api_disconnect failed: %s (%d)",
++                __FUNCTION__, strerror(-res), res);
++    }
++    mDevice->setPreviewWindow(NULL);
++    mDevice->release();
++    mDevice = NULL;
++
++    return OK;
++}
++// CameraHardwareInterfaceFlashControl implementation ends
++
++
+ }
+diff --git a/services/camera/libcameraservice/CameraFlashlight.h b/services/camera/libcameraservice/CameraFlashlight.h
+index 733c9289e2..50c450065c 100644
+--- a/services/camera/libcameraservice/CameraFlashlight.h
++++ b/services/camera/libcameraservice/CameraFlashlight.h
+@@ -18,12 +18,14 @@
+ #define ANDROID_SERVERS_CAMERA_CAMERAFLASHLIGHT_H
+ 
+ #include <string>
++#include <gui/BufferItemConsumer.h>
+ #include <gui/GLConsumer.h>
+ #include <gui/Surface.h>
+ #include <utils/KeyedVector.h>
+ #include <utils/SortedVector.h>
+ #include "common/CameraProviderManager.h"
+ #include "common/CameraDeviceBase.h"
++#include "device1/CameraHardwareInterface.h"
+ 
+ namespace android {
+ 
+@@ -140,6 +142,61 @@ class ProviderFlashControl : public FlashControlBase {
+         Mutex mLock;
+ };
+ 
++// Restored from the Android 11 tree (LineageOS lineage-18.1) for HAL1 devices.
++/**
++ * Flash control for camera module <= v2.3 and camera HAL v1
++ */
++class CameraHardwareInterfaceFlashControl : public FlashControlBase {
++    public:
++        CameraHardwareInterfaceFlashControl(
++                sp<CameraProviderManager> manager,
++                CameraProviderManager::StatusListener* callbacks);
++        virtual ~CameraHardwareInterfaceFlashControl();
++
++        // FlashControlBase
++        status_t setTorchMode(const std::string& cameraId, bool enabled);
++        status_t hasFlashUnit(const std::string& cameraId, bool *hasFlash);
++        // Torch strength control does not exist for HAL1 devices
++        status_t turnOnTorchWithStrengthLevel(const std::string& cameraId, int32_t torchStrength);
++        status_t getTorchStrengthLevel(const std::string& cameraId, int32_t* torchStrength);
++
++    private:
++        // connect to a camera device
++        status_t connectCameraDevice(const std::string& cameraId);
++
++        // disconnect and free mDevice
++        status_t disconnectCameraDevice();
++
++        // initialize the preview window
++        status_t initializePreviewWindow(const sp<CameraHardwareInterface>& device,
++                int32_t width, int32_t height);
++
++        // start preview and enable torch
++        status_t startPreviewAndTorch();
++
++        // get the smallest surface
++        status_t getSmallestSurfaceSize(int32_t *width, int32_t *height);
++
++        // protected by mLock
++        // If this function opens camera device in order to check if it has a flash unit, the
++        // camera device will remain open if keepDeviceOpen is true and the camera device will be
++        // closed if keepDeviceOpen is false. If camera device is already open when calling this
++        // function, keepDeviceOpen is ignored.
++        status_t hasFlashUnitLocked(const std::string& cameraId, bool *hasFlash, bool keepDeviceOpen);
++
++        sp<CameraProviderManager> mProviderManager;
++        CameraProviderManager::StatusListener* mCallbacks;
++        sp<CameraHardwareInterface> mDevice;
++        std::string mCameraId;
++        CameraParameters mParameters;
++        bool mTorchEnabled;
++
++        sp<BufferItemConsumer> mSurfaceTexture;
++        sp<Surface> mSurface;
++
++        Mutex mLock;
++};
++
+ } // namespace android
+ 
+ #endif
+diff --git a/services/camera/libcameraservice/CameraService.cpp b/services/camera/libcameraservice/CameraService.cpp
+index 38e52053c7..4bf736e962 100644
+--- a/services/camera/libcameraservice/CameraService.cpp
++++ b/services/camera/libcameraservice/CameraService.cpp
+@@ -88,6 +88,7 @@
+ 
+ #include "CameraService.h"
+ #include "api1/Camera2Client.h"
++#include "api1/CameraClient.h"
+ #include "api2/CameraDeviceClient.h"
+ #include "utils/CameraServiceProxyWrapper.h"
+ #include "utils/CameraTraces.h"
+@@ -1777,11 +1778,22 @@ Status CameraService::makeClient(
+         int deviceVersion = deviceVersionAndTransport.first;
+         switch(deviceVersion) {
+             case CAMERA_DEVICE_API_VERSION_1_0:
+-                ALOGE("Camera using old HAL version: %d", deviceVersion);
++                // HAL1 support restored (from Android 11): only the Camera API1 client can drive
++                // a HAL1 device, through CameraClient + CameraHardwareInterface.
++                if (effectiveApiLevel == API_1) {
++                    sp<hardware::ICameraClient> tmp = static_cast<hardware::ICameraClient*>(
++                            cameraCb.get());
++                    *client = new CameraClient(cameraService, tmp,
++                            cameraService->mAttributionAndPermissionUtils, clientAttribution,
++                            callingPid, cameraId, api1CameraId, facing, sensorOrientation,
++                            servicePid, compatInfo);
++                    ALOGV("%s: Camera1 API over HAL1 device %s", __FUNCTION__, cameraId.c_str());
++                    return Status::ok();
++                }
++                ALOGE("Camera using old HAL version: %d with the camera2 API", deviceVersion);
+                 return STATUS_ERROR_FMT(ERROR_DEPRECATED_HAL,
+-                        "Camera device \"%s\" HAL version %d no longer supported",
+-                        cameraId.c_str(), deviceVersion);
+-                break;
++                        "Camera device \"%s\" HAL version %d is only supported through the "
++                        "camera1 API", cameraId.c_str(), deviceVersion);
+             case CAMERA_DEVICE_API_VERSION_3_0:
+             case CAMERA_DEVICE_API_VERSION_3_1:
+             case CAMERA_DEVICE_API_VERSION_3_2:
+diff --git a/services/camera/libcameraservice/CameraService.h b/services/camera/libcameraservice/CameraService.h
+index e2d2e5437d..b8ada43df5 100644
+--- a/services/camera/libcameraservice/CameraService.h
++++ b/services/camera/libcameraservice/CameraService.h
+@@ -85,6 +85,7 @@ class CameraService :
+ {
+     friend class BinderService<CameraService>;
+     friend class CameraOfflineSessionClient;
++    friend class CameraClient;  // HAL1 API1 client (restored), uses mActiveClientManager
+ public:
+     class Client;
+     class BasicClient;

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Sun, 8 Nov 2026 14:44:26 +0100
+Subject: [PATCH 21/22] libcameraservice: stop a HAL1 preview outside the
+ client lock
+
+CameraClient::stopPreview() called the HAL's stopPreview() with mLock
+held. The Exynos HAL1 HAL (libexynoscamera, SM-T520) finishes a
+picture that is still being taken before its stopPreview() returns: it
+joins its picture thread. That thread's shutter and JPEG callbacks wait
+for mLock in lockIfMessageWanted(), so closing the camera with a picture
+pending hung for good.
+
+Take a reference to the hardware and turn the preview callbacks off under
+mLock, call stopPreview() without it, and take mLock again for the rest.
+The provider serializes the call with the device's other calls, and a
+disconnect in the meantime is caught by the mHardware check.
+
+Test: camcycle on the SM-T520, 100 cycles including a close with a
+picture pending per camera, no hang.
+
+Change-Id: I73b9ad30797572e770bd1c8b9d08e3d76173aab8
+Signed-off-by: Herman van Hazendonk <github.com@herrie.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libcameraservice/api1/CameraClient.cpp    | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/services/camera/libcameraservice/api1/CameraClient.cpp b/services/camera/libcameraservice/api1/CameraClient.cpp
+index e196689a4f..fa8966e928 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.cpp
++++ b/services/camera/libcameraservice/api1/CameraClient.cpp
+@@ -486,12 +486,23 @@ status_t CameraClient::startRecordingMode() {
+ // stop preview mode
+ void CameraClient::stopPreview() {
+     LOG1("stopPreview (pid %d)", getCallingPid());
+-    Mutex::Autolock lock(mLock);
+-    if (checkPidAndHardware() != NO_ERROR) return;
++    sp<CameraHardwareInterface> hardware;
++    {
++        Mutex::Autolock lock(mLock);
++        if (checkPidAndHardware() != NO_ERROR) return;
+ 
++        disableMsgType(CAMERA_MSG_PREVIEW_FRAME);
++        hardware = mHardware;
++    }
+ 
+-    disableMsgType(CAMERA_MSG_PREVIEW_FRAME);
+-    mHardware->stopPreview();
++    // Not under mLock: a HAL may finish a picture that is still being taken before its
++    // stopPreview() returns (the Exynos HAL1 HAL joins its picture thread there), and the
++    // shutter and JPEG callbacks of that picture wait for mLock in lockIfMessageWanted().
++    // The provider serializes this call with the device's other calls.
++    hardware->stopPreview();
++
++    Mutex::Autolock lock(mLock);
++    if (mHardware == 0) return;  // disconnected meanwhile
+     finishCameraStreamingOps();
+     mPreviewBuffer.clear();
+ }

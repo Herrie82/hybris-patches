@@ -1,0 +1,505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Sun, 8 Nov 2026 14:44:39 +0100
+Subject: [PATCH 22/22] libcameraservice: write HAL1 recording frames into
+ Exynos encoder buffers
+
+In buffer-queue video mode CameraClient copies each YUV recording frame
+into a buffer of the video target, locked with lockYCbCr(). The Samsung
+Exynos gralloc hands the video encoder HAL_PIXEL_FORMAT_EXYNOS_YCrCb_420_SP_M
+(0x11d) buffers, two ion buffers with the Y and the interleaved Cr/Cb
+plane, and its lock_ycbcr() refuses that format, so every frame was
+dropped and the encoder got nothing.
+
+When the lock fails, recognise such a buffer by its private_handle_t
+(magic, format, size) and write the NV21 frame through the two planes'
+ion fds at the buffer's stride, mapping them for the copy only. Any
+other buffer is still dropped. The writer is a separate file so a host
+test can build it: it parses a real handle layout, rejects other
+handles, writes rows at the stride and fails cleanly.
+
+Test: ExynosVideoBufferTest on the host, 4 tests pass; camcycle on
+the SM-T520, 100 cycles with a 2 s recording per camera each.
+
+Change-Id: Idbc66436c5038c895c50d2d27757ec61322fdd91
+Signed-off-by: Herman van Hazendonk <github.com@herrie.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ services/camera/libcameraservice/Android.bp   |   8 +
+ .../libcameraservice/api1/CameraClient.cpp    |  30 +++-
+ .../libcameraservice/api1/CameraClient.h      |   4 +-
+ .../api1/ExynosVideoBuffer.cpp                | 109 ++++++++++++
+ .../libcameraservice/api1/ExynosVideoBuffer.h |  57 +++++++
+ .../camera/libcameraservice/tests/Android.bp  |   9 +
+ .../tests/ExynosVideoBufferTest.cpp           | 156 ++++++++++++++++++
+ 7 files changed, 370 insertions(+), 3 deletions(-)
+ create mode 100644 services/camera/libcameraservice/api1/ExynosVideoBuffer.cpp
+ create mode 100644 services/camera/libcameraservice/api1/ExynosVideoBuffer.h
+ create mode 100644 services/camera/libcameraservice/tests/ExynosVideoBufferTest.cpp
+
+diff --git a/services/camera/libcameraservice/Android.bp b/services/camera/libcameraservice/Android.bp
+index 3f2d4e1c21..b46f39f1d0 100644
+--- a/services/camera/libcameraservice/Android.bp
++++ b/services/camera/libcameraservice/Android.bp
+@@ -149,6 +149,7 @@ cc_library {
+         "config/SharedSessionConfigReader.cpp",
+         "api1/Camera2Client.cpp",
+         "api1/CameraClient.cpp",
++        ":libcameraservice_exynos_video_buffer",
+         "device1/CameraHardwareInterface.cpp",
+         "api1/client2/Parameters.cpp",
+         "api1/client2/FrameProcessor.cpp",
+@@ -307,3 +308,10 @@ cc_library_static {
+         "-Wno-ignored-qualifiers",
+     ],
+ }
++
++// The Exynos two-plane video buffer writer of api1/CameraClient, on its own so that the host
++// tests can build it.
++filegroup {
++    name: "libcameraservice_exynos_video_buffer",
++    srcs: ["api1/ExynosVideoBuffer.cpp"],
++}
+diff --git a/services/camera/libcameraservice/api1/CameraClient.cpp b/services/camera/libcameraservice/api1/CameraClient.cpp
+index fa8966e928..d361b37902 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.cpp
++++ b/services/camera/libcameraservice/api1/CameraClient.cpp
+@@ -32,6 +32,7 @@
+ #include <media/hardware/HardwareAPI.h>
+ 
+ #include "api1/CameraClient.h"
++#include "api1/ExynosVideoBuffer.h"
+ #include "device1/CameraHardwareInterface.h"
+ #include "CameraService.h"
+ 
+@@ -1298,6 +1299,7 @@ status_t CameraClient::setVideoTarget(const sp<SurfaceType>& target) {
+     mVideoWindow = window;
+     mVideoWidth = width;
+     mVideoHeight = height;
++    mVideoExynosPlanesLogged = false;
+     LOG1("setVideoTarget: %dx%d", width, height);
+     return NO_ERROR;
+ }
+@@ -1382,7 +1384,27 @@ void CameraClient::copyFrameToVideoWindow(nsecs_t timestamp, const sp<IMemory>&
+     res = GraphicBufferMapper::get().lockYCbCr(anb->handle, GRALLOC_USAGE_SW_WRITE_RARELY,
+             Rect(width, height), &ycbcr);
+     if (res != NO_ERROR || ycbcr.y == nullptr || ycbcr.cb == nullptr || ycbcr.cr == nullptr) {
+-        ALOGE("%s: locking a video buffer failed: %s (%d)", __FUNCTION__, strerror(-res), res);
++        if (res == NO_ERROR) GraphicBufferMapper::get().unlock(anb->handle);
++        // The Exynos gralloc cannot lock its two-plane encoder format for the CPU; write that one
++        // through its planes' ion fds instead. Any other buffer is dropped as before.
++        exynos_video_buffer::Planes planes;
++        if (exynos_video_buffer::parse(anb->handle, width, height, &planes)) {
++            res = exynos_video_buffer::writeNv21(planes, width, height, src);
++            if (res == NO_ERROR) {
++                if (!mVideoExynosPlanesLogged) {
++                    ALOGI("%s: writing %dx%d recording frames to Exynos YCrCb_420_SP_M buffers "
++                            "(stride %d, vstride %d)", __FUNCTION__, width, height, planes.stride,
++                            planes.vstride);
++                    mVideoExynosPlanesLogged = true;
++                }
++                queueVideoBufferLocked(anb, timestamp);
++                return;
++            }
++            ALOGE("%s: writing an Exynos video buffer failed: %s (%d)", __FUNCTION__,
++                    strerror(-res), res);
++        } else {
++            ALOGE("%s: locking a video buffer failed: %s (%d)", __FUNCTION__, strerror(-res), res);
++        }
+         mVideoWindow->cancelBuffer(mVideoWindow.get(), anb, -1);
+         return;
+     }
+@@ -1405,8 +1427,12 @@ void CameraClient::copyFrameToVideoWindow(nsecs_t timestamp, const sp<IMemory>&
+     }
+ 
+     GraphicBufferMapper::get().unlock(anb->handle);
++    queueVideoBufferLocked(anb, timestamp);
++}
++
++void CameraClient::queueVideoBufferLocked(ANativeWindowBuffer* anb, nsecs_t timestamp) {
+     native_window_set_buffers_timestamp(mVideoWindow.get(), timestamp);
+-    res = mVideoWindow->queueBuffer(mVideoWindow.get(), anb, -1);
++    const status_t res = mVideoWindow->queueBuffer(mVideoWindow.get(), anb, -1);
+     if (res != NO_ERROR) {
+         ALOGE("%s: queueing a video buffer failed: %s (%d)", __FUNCTION__, strerror(-res), res);
+     }
+diff --git a/services/camera/libcameraservice/api1/CameraClient.h b/services/camera/libcameraservice/api1/CameraClient.h
+index c37fd2b703..56c4116086 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.h
++++ b/services/camera/libcameraservice/api1/CameraClient.h
+@@ -182,12 +182,14 @@ private:
+     // delivering YUV recording frames through the data callback, and each one is copied into a buffer
+     // of the video target (CameraSource's BufferQueue) and released to the HAL straight away.
+     bool                            mVideoBufferQueueMode;
+-    Mutex                           mVideoWindowLock;   // guards the three below
++    Mutex                           mVideoWindowLock;   // guards the four below
+     sp<ANativeWindow>               mVideoWindow;
+     int                             mVideoWidth;
+     int                             mVideoHeight;
++    bool                            mVideoExynosPlanesLogged = false;  // once per video target
+     void                            disconnectVideoWindow();
+     void                            copyFrameToVideoWindow(nsecs_t timestamp, const sp<IMemory>& dataPtr);
++    void                            queueVideoBufferLocked(ANativeWindowBuffer* anb, nsecs_t timestamp);
+ 
+     // Buffer-queue recording frames go back to the HAL from this thread, never from inside the
+     // HAL's data callback. The callback is a HIDL call from the provider's callback thread, so a
+diff --git a/services/camera/libcameraservice/api1/ExynosVideoBuffer.cpp b/services/camera/libcameraservice/api1/ExynosVideoBuffer.cpp
+new file mode 100644
+index 0000000000..8b77bcb9ac
+--- /dev/null
++++ b/services/camera/libcameraservice/api1/ExynosVideoBuffer.cpp
+@@ -0,0 +1,109 @@
++/*
++ * Copyright (C) 2026 The LuneOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "ExynosVideoBuffer.h"
++
++#include <errno.h>
++#include <string.h>
++#include <sys/mman.h>
++
++namespace android {
++namespace exynos_video_buffer {
++
++namespace {
++
++// Indices into native_handle_t::data[] (see the header).
++enum : uint8_t {
++    kFd = 0,
++    kFd1 = 1,
++    kMagicIdx = 3,
++    kFormatIdx = 7,
++    kWidthIdx = 8,
++    kHeightIdx = 9,
++    kStrideIdx = 10,
++    kVstrideIdx = 11,
++    kMinSlots = 12,
++};
++
++constexpr int kMaxDimension = 8192;
++
++// The chroma plane holds vstride / 2 rows, rounded up to 8 as the gralloc allocates it; the copy
++// only touches the first height / 2 of them.
++size_t chromaRows(int vstride) {
++    return (static_cast<size_t>(vstride) / 2 + 7) & ~static_cast<size_t>(7);
++}
++
++}  // namespace
++
++bool parse(const native_handle_t* handle, int width, int height, Planes* out) {
++    if (handle == nullptr || out == nullptr || width <= 0 || height <= 0 ||
++            (width & 1) != 0 || (height & 1) != 0) {
++        return false;
++    }
++    if (handle->numFds != 2 || handle->numInts < 0 ||
++            handle->numFds + handle->numInts < kMinSlots) {
++        return false;
++    }
++    const int* d = handle->data;
++    if (d[kMagicIdx] != kMagic || d[kFormatIdx] != kFormatYCrCb420SpM ||
++            d[kWidthIdx] != width || d[kHeightIdx] != height) {
++        return false;
++    }
++    const int stride = d[kStrideIdx], vstride = d[kVstrideIdx];
++    if (stride < width || stride > kMaxDimension || vstride < height || vstride > kMaxDimension ||
++            d[kFd] < 0 || d[kFd1] < 0) {
++        return false;
++    }
++    *out = Planes{d[kFd], d[kFd1], stride, vstride};
++    return true;
++}
++
++int writeNv21(const Planes& planes, int width, int height, const uint8_t* nv21) {
++    if (nv21 == nullptr || width <= 0 || height <= 0 || planes.stride < width || planes.vstride < height) {
++        return -EINVAL;
++    }
++    const size_t stride = static_cast<size_t>(planes.stride);
++    const size_t ySize = stride * static_cast<size_t>(planes.vstride);
++    const size_t cSize = stride * chromaRows(planes.vstride);
++
++    void* y = mmap(nullptr, ySize, PROT_WRITE, MAP_SHARED, planes.yFd, 0);
++    if (y == MAP_FAILED) return -errno;
++    void* c = mmap(nullptr, cSize, PROT_WRITE, MAP_SHARED, planes.cFd, 0);
++    if (c == MAP_FAILED) {
++        const int err = errno;
++        munmap(y, ySize);
++        return -err;
++    }
++
++    const size_t w = static_cast<size_t>(width);
++    uint8_t* dy = static_cast<uint8_t*>(y);
++    for (int row = 0; row < height; row++) {
++        memcpy(dy + row * stride, nv21 + row * w, w);
++    }
++    // Both NV21 and YCrCb_420_SP_M interleave V before U: rows copy as they are.
++    const uint8_t* vu = nv21 + w * static_cast<size_t>(height);
++    uint8_t* dc = static_cast<uint8_t*>(c);
++    for (int row = 0; row < height / 2; row++) {
++        memcpy(dc + row * stride, vu + row * w, w);
++    }
++
++    munmap(c, cSize);
++    munmap(y, ySize);
++    return 0;
++}
++
++}  // namespace exynos_video_buffer
++}  // namespace android
+diff --git a/services/camera/libcameraservice/api1/ExynosVideoBuffer.h b/services/camera/libcameraservice/api1/ExynosVideoBuffer.h
+new file mode 100644
+index 0000000000..0c968f3993
+--- /dev/null
++++ b/services/camera/libcameraservice/api1/ExynosVideoBuffer.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (C) 2026 The LuneOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_SERVERS_CAMERA_EXYNOS_VIDEO_BUFFER_H
++#define ANDROID_SERVERS_CAMERA_EXYNOS_VIDEO_BUFFER_H
++
++#include <stdint.h>
++
++#include <cutils/native_handle.h>
++
++namespace android {
++namespace exynos_video_buffer {
++
++// The Samsung Exynos gralloc (hardware/samsung_slsi/exynos/gralloc) hands the video encoder
++// HAL_PIXEL_FORMAT_EXYNOS_YCrCb_420_SP_M buffers: two ion buffers, the Y plane in the first and the
++// interleaved Cr/Cb plane in the second, rows of `stride` bytes. Its lock_ycbcr() refuses that
++// format and its lock() writes a second plane pointer the 16.0 mapper has no room for, so neither
++// gives the CPU a way in.
++//
++// Layout of its private_handle_t as seen through native_handle_t::data[]: three fds (fd, fd1, fd2;
++// fd2 is -1 and counted as an int when there are two planes), then magic, flags, size, offset,
++// format, width, height, stride, vstride.
++constexpr int kMagic = 0x3141592;
++constexpr int kFormatYCrCb420SpM = 0x11D;  // HAL_PIXEL_FORMAT_EXYNOS_YCrCb_420_SP_M
++
++struct Planes {
++    int yFd;
++    int cFd;
++    int stride;   // bytes per row, both planes
++    int vstride;  // rows allocated in the Y plane
++};
++
++// Whether `handle` is such a buffer, `width` x `height`; fills `out` if so. Anything else, including
++// a handle of any other gralloc, is rejected without being written to.
++bool parse(const native_handle_t* handle, int width, int height, Planes* out);
++
++// Write one NV21 frame (Y plane of width * height bytes, then interleaved V/U rows of width bytes)
++// into the buffer's two planes. The planes are mapped for the copy only. Returns 0 or -errno.
++int writeNv21(const Planes& planes, int width, int height, const uint8_t* nv21);
++
++}  // namespace exynos_video_buffer
++}  // namespace android
++
++#endif  // ANDROID_SERVERS_CAMERA_EXYNOS_VIDEO_BUFFER_H
+diff --git a/services/camera/libcameraservice/tests/Android.bp b/services/camera/libcameraservice/tests/Android.bp
+index c528f1e29b..34c50fe784 100644
+--- a/services/camera/libcameraservice/tests/Android.bp
++++ b/services/camera/libcameraservice/tests/Android.bp
+@@ -135,6 +135,15 @@ cc_test_host {
+         "cameraservice_test_hostsupported",
+     ],
+ 
++    srcs: [
++        "ExynosVideoBufferTest.cpp",
++        ":libcameraservice_exynos_video_buffer",
++    ],
++
++    header_libs: [
++        "libcutils_headers",
++    ],
++
+     include_dirs: [
+         "frameworks/av/camera/include",
+         "frameworks/av/camera/include/camera",
+diff --git a/services/camera/libcameraservice/tests/ExynosVideoBufferTest.cpp b/services/camera/libcameraservice/tests/ExynosVideoBufferTest.cpp
+new file mode 100644
+index 0000000000..0a15d33bb8
+--- /dev/null
++++ b/services/camera/libcameraservice/tests/ExynosVideoBufferTest.cpp
+@@ -0,0 +1,156 @@
++/*
++ * Copyright (C) 2026 The LuneOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <cstring>
++#include <vector>
++
++#include <android-base/file.h>
++#include <gtest/gtest.h>
++
++#include "../api1/ExynosVideoBuffer.h"
++
++using namespace android::exynos_video_buffer;
++
++namespace {
++
++// A native_handle_t laid out as the Exynos gralloc's private_handle_t for a two-plane buffer.
++struct FakeHandle {
++    native_handle_t h;
++    int data[16];
++};
++
++class ExynosVideoBufferTest : public ::testing::Test {
++  protected:
++    static constexpr int kW = 64, kH = 36, kStride = 80, kVstride = 48;
++
++    void SetUp() override {
++        yFd = yFile.release();
++        cFd = cFile.release();
++        ASSERT_GE(yFd, 0);
++        ASSERT_GE(cFd, 0);
++        ySize = static_cast<size_t>(kStride) * kVstride + 256;
++        cSize = static_cast<size_t>(kStride) * 24 + 256;
++        ASSERT_EQ(0, ftruncate(yFd, static_cast<off_t>(ySize)));
++        ASSERT_EQ(0, ftruncate(cFd, static_cast<off_t>(cSize)));
++        memset(&fh, 0, sizeof(fh));
++        fh.h.version = sizeof(native_handle_t);
++        fh.h.numFds = 2;
++        fh.h.numInts = 14;
++        d = fh.h.data;  // through a pointer: data[] is a zero-length array
++        d[0] = yFd;
++        d[1] = cFd;
++        d[2] = -1;
++        d[3] = kMagic;
++        d[7] = kFormatYCrCb420SpM;
++        d[8] = kW;
++        d[9] = kH;
++        d[10] = kStride;
++        d[11] = kVstride;
++    }
++    void TearDown() override {
++        close(yFd);
++        close(cFd);
++    }
++    std::vector<uint8_t> readFd(int fd, size_t size) {
++        std::vector<uint8_t> v(size);
++        EXPECT_EQ(static_cast<ssize_t>(size), pread(fd, v.data(), size, 0));
++        return v;
++    }
++
++    TemporaryFile yFile, cFile;
++    FakeHandle fh;
++    int* d = nullptr;
++    int yFd = -1, cFd = -1;
++    size_t ySize = 0, cSize = 0;
++};
++
++TEST_F(ExynosVideoBufferTest, ParsesTheExynosHandle) {
++    Planes p{};
++    ASSERT_TRUE(parse(&fh.h, kW, kH, &p));
++    EXPECT_EQ(yFd, p.yFd);
++    EXPECT_EQ(cFd, p.cFd);
++    EXPECT_EQ(kStride, p.stride);
++    EXPECT_EQ(kVstride, p.vstride);
++}
++
++TEST_F(ExynosVideoBufferTest, RejectsOtherHandles) {
++    Planes p{};
++    EXPECT_FALSE(parse(nullptr, kW, kH, &p));
++    EXPECT_FALSE(parse(&fh.h, kW, kH, nullptr));
++    EXPECT_FALSE(parse(&fh.h, kW + 2, kH, &p));     // other size
++    EXPECT_FALSE(parse(&fh.h, kW, kH + 2, &p));
++    EXPECT_FALSE(parse(&fh.h, kW + 1, kH, &p));     // odd size
++    d[3] = 0;                               // other magic
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    d[3] = kMagic;
++    d[7] = 0x11;                            // single-plane NV21
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    d[7] = kFormatYCrCb420SpM;
++    fh.h.numFds = 1;                                // one plane
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    fh.h.numFds = 2;
++    fh.h.numInts = 9;                               // too short to hold vstride
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    fh.h.numInts = 14;
++    d[10] = kW - 2;                         // stride below width
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    d[10] = 100000;                         // absurd stride
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    d[10] = kStride;
++    d[11] = kH - 2;                         // vstride below height
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    d[11] = kVstride;
++    d[1] = -1;                              // no chroma fd
++    EXPECT_FALSE(parse(&fh.h, kW, kH, &p));
++    d[1] = cFd;
++    EXPECT_TRUE(parse(&fh.h, kW, kH, &p));
++}
++
++TEST_F(ExynosVideoBufferTest, WritesNv21RowsAtTheStride) {
++    std::vector<uint8_t> src(static_cast<size_t>(kW) * kH * 3 / 2);
++    for (size_t i = 0; i < src.size(); i++) src[i] = static_cast<uint8_t>(i * 7 + 3);
++    Planes p{};
++    ASSERT_TRUE(parse(&fh.h, kW, kH, &p));
++    ASSERT_EQ(0, writeNv21(p, kW, kH, src.data()));
++
++    const std::vector<uint8_t> y = readFd(yFd, ySize);
++    const std::vector<uint8_t> c = readFd(cFd, cSize);
++    for (int row = 0; row < kH; row++) {
++        ASSERT_EQ(0, memcmp(&y[row * kStride], &src[row * kW], kW)) << "Y row " << row;
++        for (int x = kW; x < kStride; x++) ASSERT_EQ(0, y[row * kStride + x]) << "Y padding";
++    }
++    for (size_t i = static_cast<size_t>(kH) * kStride; i < ySize; i++) ASSERT_EQ(0, y[i]);
++    const uint8_t* vu = &src[static_cast<size_t>(kW) * kH];
++    for (int row = 0; row < kH / 2; row++) {
++        ASSERT_EQ(0, memcmp(&c[row * kStride], &vu[row * kW], kW)) << "VU row " << row;
++        for (int x = kW; x < kStride; x++) ASSERT_EQ(0, c[row * kStride + x]) << "VU padding";
++    }
++    for (size_t i = static_cast<size_t>(kH / 2) * kStride; i < cSize; i++) ASSERT_EQ(0, c[i]);
++}
++
++TEST_F(ExynosVideoBufferTest, WriteFailsCleanly) {
++    std::vector<uint8_t> src(static_cast<size_t>(kW) * kH * 3 / 2);
++    Planes p{yFd, cFd, kStride, kVstride};
++    EXPECT_EQ(-EINVAL, writeNv21(p, kW, kH, nullptr));
++    EXPECT_EQ(-EINVAL, writeNv21(Planes{yFd, cFd, kW - 2, kVstride}, kW, kH, src.data()));
++    EXPECT_LT(writeNv21(Planes{-1, cFd, kStride, kVstride}, kW, kH, src.data()), 0);
++    EXPECT_LT(writeNv21(Planes{yFd, -1, kStride, kVstride}, kW, kH, src.data()), 0);
++}
++
++}  // namespace

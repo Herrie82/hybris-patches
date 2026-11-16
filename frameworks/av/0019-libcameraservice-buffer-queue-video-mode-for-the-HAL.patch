@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Thu, 8 Oct 2026 10:29:15 +0200
+Subject: [PATCH 19/22] libcameraservice: buffer-queue video mode for the HAL1
+ CameraClient
+
+Android's CameraSource now records only in VIDEO_BUFFER_MODE_BUFFER_QUEUE:
+it hands the camera a video target (its own BufferQueue) and waits for frames
+there. The restored HAL1 CameraClient refused both setVideoTarget() and that
+mode, so CameraSource came up without a format and droidmedia's recorder
+crashed on it.
+
+Accept the mode and the target. The HAL keeps delivering its YUV recording
+frames (NV21) through the data callback; each one is copied into a buffer of
+the target, in the plane layout gralloc gave it, queued with the frame's
+timestamp and released to the HAL at once. The target is asked for
+IMPLEMENTATION_DEFINED buffers with rare CPU writes, so gralloc picks the
+encoder's layout and maps them uncached: the encoder reads them by DMA, and an
+unlock that leaves the CPU cache dirty gave green frames.
+
+A HAL without metadata support rejects storeMetaDataInBuffers(false) too (the
+HP TouchPad's answers BAD_VALUE); turning metadata off is what YUV frames need,
+so that is not treated as an error.
+
+Tested on the HP TouchPad (msm8660 HAL1): hardware H.264 recordings at 640x480
+with a correct picture.
+
+Change-Id: I40b9da4cf387981aa5a08dbe8a7b76e2f05cd016
+Signed-off-by: Herman van Hazendonk <github.com@herrie.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libcameraservice/api1/CameraClient.cpp    | 149 +++++++++++++++++-
+ .../libcameraservice/api1/CameraClient.h      |  11 ++
+ 2 files changed, 156 insertions(+), 4 deletions(-)
+
+diff --git a/services/camera/libcameraservice/api1/CameraClient.cpp b/services/camera/libcameraservice/api1/CameraClient.cpp
+index 8ef2d4e367..db35a29017 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.cpp
++++ b/services/camera/libcameraservice/api1/CameraClient.cpp
+@@ -25,6 +25,8 @@
+ #include <cutils/atomic.h>
+ #include <cutils/properties.h>
+ #include <gui/Surface.h>
++#include <ui/GraphicBufferMapper.h>
++#include <ui/Rect.h>
+ #include <media/hardware/HardwareAPI.h>
+ 
+ #include "api1/CameraClient.h"
+@@ -59,6 +61,9 @@ CameraClient::CameraClient(const sp<CameraService>& cameraService,
+     mPreviewCallbackFlag = CAMERA_FRAME_CALLBACK_FLAG_NOOP;
+     mOrientation = getOrientation(0, mCameraFacing == CAMERA_FACING_FRONT);
+     mPlayShutterSound = true;
++    mVideoBufferQueueMode = false;
++    mVideoWidth = 0;
++    mVideoHeight = 0;
+ 
+     mLongshotEnabled = false;
+     mBurstCnt = 0;
+@@ -273,6 +278,8 @@ binder::Status CameraClient::disconnect() {
+     // Release the hardware resources.
+     mHardware->release();
+ 
++    disconnectVideoWindow();
++
+     // Release the held ANativeWindow resources.
+     if (mPreviewWindow != 0) {
+         disconnectWindow(mPreviewWindow);
+@@ -491,6 +498,7 @@ void CameraClient::stopRecording() {
+ 
+         disableMsgType(CAMERA_MSG_VIDEO_FRAME);
+         mHardware->stopRecording();
++        disconnectVideoWindow();
+         sCameraService->playSound(CameraService::SOUND_RECORDING_STOP);
+ 
+         mPreviewBuffer.clear();
+@@ -604,9 +612,13 @@ void CameraClient::releaseRecordingFrameHandleBatch(const std::vector<native_han
+ status_t CameraClient::setVideoBufferMode(int32_t videoBufferMode) {
+     LOG1("setVideoBufferMode: %d", videoBufferMode);
+     bool enableMetadataInBuffers = false;
++    bool bufferQueueMode = false;
+ 
+     if (videoBufferMode == VIDEO_BUFFER_MODE_DATA_CALLBACK_METADATA) {
+         enableMetadataInBuffers = true;
++    } else if (videoBufferMode == VIDEO_BUFFER_MODE_BUFFER_QUEUE) {
++        // The HAL keeps sending YUV frames; handleGenericDataTimestamp() copies them to the target.
++        bufferQueueMode = true;
+     } else if (videoBufferMode != VIDEO_BUFFER_MODE_DATA_CALLBACK_YUV) {
+         ALOGE("%s: %d: videoBufferMode %d is not supported.", __FUNCTION__, __LINE__,
+                 videoBufferMode);
+@@ -618,7 +630,15 @@ status_t CameraClient::setVideoBufferMode(int32_t videoBufferMode) {
+         return UNKNOWN_ERROR;
+     }
+ 
+-    return mHardware->storeMetaDataInBuffers(enableMetadataInBuffers);
++    status_t res = mHardware->storeMetaDataInBuffers(enableMetadataInBuffers);
++    // A HAL without metadata support rejects the call even when asked to turn it off (the HP TouchPad's
++    // answers BAD_VALUE); off is what YUV frames need, so that is not an error.
++    if (!enableMetadataInBuffers && res != NO_ERROR) {
++        LOG1("setVideoBufferMode: HAL has no metadata mode (%d), using YUV frames", res);
++        res = NO_ERROR;
++    }
++    if (res == NO_ERROR) mVideoBufferQueueMode = bufferQueueMode;
++    return res;
+ }
+ 
+ bool CameraClient::previewEnabled() {
+@@ -1091,6 +1111,12 @@ void CameraClient::handleGenericDataTimestamp(nsecs_t timestamp,
+     int32_t msgType, const sp<IMemory>& dataPtr) {
+     sp<hardware::ICameraClient> c = mRemoteCallback;
+     mLock.unlock();
++    if (msgType == CAMERA_MSG_VIDEO_FRAME && mVideoBufferQueueMode && dataPtr != nullptr) {
++        copyFrameToVideoWindow(timestamp, dataPtr);
++        Mutex::Autolock l(mLock);
++        if (mHardware != 0) mHardware->releaseRecordingFrame(dataPtr);
++        return;
++    }
+     if (c != 0 && dataPtr != nullptr) {
+         native_handle_t* handle = nullptr;
+ 
+@@ -1193,9 +1219,124 @@ int CameraClient::getOrientation(int degrees, bool mirror) {
+ }
+ 
+ status_t CameraClient::setVideoTarget(const sp<SurfaceType>& target) {
+-    (void)target;
+-    ALOGE("%s: %d: CameraClient doesn't support setting a video target.", __FUNCTION__, __LINE__);
+-    return INVALID_OPERATION;
++    LOG1("setVideoTarget(%p) (pid %d)", target.get(), getCallingPid());
++    Mutex::Autolock lock(mLock);
++    status_t res = checkPidAndHardware();
++    if (res != NO_ERROR) return res;
++
++    disconnectVideoWindow();
++    if (target == 0) return NO_ERROR;
++
++#if WB_LIBCAMERASERVICE_WITH_DEPENDENCIES
++    sp<IGraphicBufferProducer> bufferProducer = target->getIGraphicBufferProducer();
++#else
++    sp<IGraphicBufferProducer> bufferProducer = target;
++#endif
++    sp<ANativeWindow> window = new Surface(bufferProducer, /*controlledByApp*/ false);
++
++    CameraParameters params(mHardware->getParameters());
++    int width = -1, height = -1;
++    params.getVideoSize(&width, &height);
++    if (width <= 0 || height <= 0) params.getPreviewSize(&width, &height);
++    if (width <= 0 || height <= 0) {
++        ALOGE("%s: no video or preview size set", __FUNCTION__);
++        return BAD_VALUE;
++    }
++
++    res = native_window_api_connect(window.get(), NATIVE_WINDOW_API_CAMERA);
++    if (res != NO_ERROR) {
++        ALOGE("%s: connecting to the video target failed: %s (%d)", __FUNCTION__,
++                strerror(-res), res);
++        return res;
++    }
++    // The consumer (CameraSource) asks for HW_VIDEO_ENCODER usage with an implementation-defined
++    // format, from which gralloc picks the layout the device's encoder reads. The frames are written
++    // by the CPU and read by the encoder's DMA, so declare the writes as rare: gralloc then maps the
++    // buffers uncached, and nothing is left in the CPU cache when the encoder reads them (an unlock
++    // that does not clean the cache gave green frames on the HP TouchPad).
++    if ((res = native_window_set_buffers_dimensions(window.get(), width, height)) != NO_ERROR ||
++            (res = native_window_set_buffers_format(window.get(),
++                    HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED)) != NO_ERROR ||
++            (res = native_window_set_usage(window.get(), GRALLOC_USAGE_SW_WRITE_RARELY)) != NO_ERROR) {
++        ALOGE("%s: configuring the video target failed: %s (%d)", __FUNCTION__,
++                strerror(-res), res);
++        native_window_api_disconnect(window.get(), NATIVE_WINDOW_API_CAMERA);
++        return res;
++    }
++
++    Mutex::Autolock l(mVideoWindowLock);
++    mVideoWindow = window;
++    mVideoWidth = width;
++    mVideoHeight = height;
++    LOG1("setVideoTarget: %dx%d", width, height);
++    return NO_ERROR;
++}
++
++void CameraClient::disconnectVideoWindow() {
++    Mutex::Autolock l(mVideoWindowLock);
++    if (mVideoWindow != 0) {
++        native_window_api_disconnect(mVideoWindow.get(), NATIVE_WINDOW_API_CAMERA);
++        mVideoWindow.clear();
++    }
++}
++
++// Copy one YUV 4:2:0 semi-planar recording frame of the HAL (NV21, the format of the camera HAL1
++// preview and video frames: Y plane, then interleaved V/U at width * height) into a buffer of the video
++// target, in whatever plane layout gralloc gave that buffer, and queue it with the frame's timestamp.
++void CameraClient::copyFrameToVideoWindow(nsecs_t timestamp, const sp<IMemory>& dataPtr) {
++    Mutex::Autolock l(mVideoWindowLock);
++    if (mVideoWindow == 0) return;
++
++    const int width = mVideoWidth, height = mVideoHeight;
++    const size_t frameSize = (size_t) width * height * 3 / 2;
++    // TODO: Using unsecurePointer() has some associated security pitfalls (see its declaration);
++    //       the frame comes from the HAL's own heap and is only read here, within its size.
++    const uint8_t* src = (const uint8_t*) dataPtr->unsecurePointer();
++    if (src == nullptr || dataPtr->size() < frameSize) {
++        ALOGE("%s: recording frame of %zu bytes is smaller than %dx%d", __FUNCTION__,
++                dataPtr->size(), width, height);
++        return;
++    }
++
++    ANativeWindowBuffer* anb = nullptr;
++    status_t res = native_window_dequeue_buffer_and_wait(mVideoWindow.get(), &anb);
++    if (res != NO_ERROR) {
++        ALOGE("%s: dequeueing a video buffer failed: %s (%d)", __FUNCTION__, strerror(-res), res);
++        return;
++    }
++
++    android_ycbcr ycbcr = {};
++    res = GraphicBufferMapper::get().lockYCbCr(anb->handle, GRALLOC_USAGE_SW_WRITE_RARELY,
++            Rect(width, height), &ycbcr);
++    if (res != NO_ERROR || ycbcr.y == nullptr || ycbcr.cb == nullptr || ycbcr.cr == nullptr) {
++        ALOGE("%s: locking a video buffer failed: %s (%d)", __FUNCTION__, strerror(-res), res);
++        mVideoWindow->cancelBuffer(mVideoWindow.get(), anb, -1);
++        return;
++    }
++
++    uint8_t* y = (uint8_t*) ycbcr.y;
++    for (int row = 0; row < height; row++)
++        memcpy(y + row * ycbcr.ystride, src + (size_t) row * width, width);
++
++    const uint8_t* vu = src + (size_t) width * height;
++    uint8_t* cb = (uint8_t*) ycbcr.cb;
++    uint8_t* cr = (uint8_t*) ycbcr.cr;
++    for (int row = 0; row < height / 2; row++) {
++        const uint8_t* s = vu + (size_t) row * width;
++        uint8_t* dcb = cb + row * ycbcr.cstride;
++        uint8_t* dcr = cr + row * ycbcr.cstride;
++        for (int x = 0; x < width / 2; x++) {
++            dcr[x * ycbcr.chroma_step] = s[2 * x];
++            dcb[x * ycbcr.chroma_step] = s[2 * x + 1];
++        }
++    }
++
++    GraphicBufferMapper::get().unlock(anb->handle);
++    native_window_set_buffers_timestamp(mVideoWindow.get(), timestamp);
++    res = mVideoWindow->queueBuffer(mVideoWindow.get(), anb, -1);
++    if (res != NO_ERROR) {
++        ALOGE("%s: queueing a video buffer failed: %s (%d)", __FUNCTION__, strerror(-res), res);
++    }
+ }
+ 
+ status_t CameraClient::setAudioRestriction(int mode) {
+diff --git a/services/camera/libcameraservice/api1/CameraClient.h b/services/camera/libcameraservice/api1/CameraClient.h
+index fd57b6aaed..1686278274 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.h
++++ b/services/camera/libcameraservice/api1/CameraClient.h
+@@ -172,6 +172,17 @@ private:
+     sp<IBinder>                     mSurface;
+     sp<ANativeWindow>               mPreviewWindow;
+ 
++    // VIDEO_BUFFER_MODE_BUFFER_QUEUE, the only mode Android's CameraSource still uses: the HAL keeps
++    // delivering YUV recording frames through the data callback, and each one is copied into a buffer
++    // of the video target (CameraSource's BufferQueue) and released to the HAL straight away.
++    bool                            mVideoBufferQueueMode;
++    Mutex                           mVideoWindowLock;   // guards the three below
++    sp<ANativeWindow>               mVideoWindow;
++    int                             mVideoWidth;
++    int                             mVideoHeight;
++    void                            disconnectVideoWindow();
++    void                            copyFrameToVideoWindow(nsecs_t timestamp, const sp<IMemory>& dataPtr);
++
+     // If the user want us to return a copy of the preview frame (instead
+     // of the original one), we allocate mPreviewBuffer and reuse it if possible.
+     sp<MemoryHeapBase>              mPreviewBuffer;

@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Sun, 8 Nov 2026 05:51:35 +0100
+Subject: [PATCH 20/22] libcameraservice: hand HAL1 recording frames back off
+ the callback thread
+
+In buffer-queue video mode CameraClient copied each recording frame into
+the video target and then released it to the HAL from inside
+handleGenericDataTimestamp(), on the HAL's data callback thread. That
+deadlocked QCamera2 (msm8916, the Galaxy A3 2015) in two ways:
+
+- The release took mLock again. stopRecording() holds mLock across
+  mHardware->stopRecording(), which on QCamera2 joins exactly that
+  callback thread (QCameraChannel::stop() -> QCameraCmdThread::exit() ->
+  pthread_join), so each waited for the other for good.
+- Without mLock, the release is still a nested HIDL call made from
+  inside the provider's callback, which binder runs on that same
+  provider thread. stopRecording() holds the HIDL CameraDevice's lock
+  while it joins the thread, so the nested release waited for the lock
+  and the join waited for the release.
+
+Either way the camera stayed wedged until minimediaservice restarted.
+
+The callback now reads the mode and takes a reference to the hardware
+interface while mLock is still held, and queues the release for a
+CamFrameRelease thread instead of making it. The callback returns at
+once, the join completes and the release follows. disconnect() and the
+destructor stop the thread before mHardware->release(); it first hands
+back everything still queued. A frame that arrives after that is
+dropped with a warning: the HAL frees its buffers anyway.
+
+Tested on the Galaxy A3 (2015): 100/100 cycles of the camcycle soak
+(preview, pictures, hardware recording, close while recording, both
+cameras). Built for halium_arm64 and halium_arm with -Werror. clang
+--analyze (alpha unix/security/core/cplusplus checkers), clang-tidy,
+cppcheck and flawfinder report nothing on the new lines; what they
+report is all in the file without this change too. There is no unit
+test for the HAL1 CameraClient to extend.
+
+Change-Id: Ic2d9e94873806ffe713c28aaa274fdd5870d1e5f
+Signed-off-by: Herman van Hazendonk <github.com@herrie.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libcameraservice/api1/CameraClient.cpp    | 68 ++++++++++++++++++-
+ .../libcameraservice/api1/CameraClient.h      | 24 +++++++
+ 2 files changed, 89 insertions(+), 3 deletions(-)
+
+diff --git a/services/camera/libcameraservice/api1/CameraClient.cpp b/services/camera/libcameraservice/api1/CameraClient.cpp
+index db35a29017..e196689a4f 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.cpp
++++ b/services/camera/libcameraservice/api1/CameraClient.cpp
+@@ -22,6 +22,8 @@
+ #define LOG_TAG "CameraClient"
+ //#define LOG_NDEBUG 0
+ 
++#include <pthread.h>
++
+ #include <cutils/atomic.h>
+ #include <cutils/properties.h>
+ #include <gui/Surface.h>
+@@ -119,6 +121,9 @@ CameraClient::~CameraClient() {
+     LOG1("CameraClient::~CameraClient E (pid %d, this %p)", callingPid, this);
+ 
+     disconnect();
++    // disconnect() returns early for a pid that is not the client's; the
++    // thread must still be gone before the members it uses are.
++    stopFrameReleaseThread();
+     LOG1("CameraClient::~CameraClient X (pid %d, this %p)", callingPid, this);
+ }
+ 
+@@ -275,6 +280,8 @@ binder::Status CameraClient::disconnect() {
+     mHardware->stopPreview();
+     finishCameraStreamingOps();
+     mHardware->cancelPicture();
++    // Hand back any recording frames still queued while the device is open.
++    stopFrameReleaseThread();
+     // Release the hardware resources.
+     mHardware->release();
+ 
+@@ -1110,11 +1117,23 @@ void CameraClient::handleGenericData(int32_t msgType,
+ void CameraClient::handleGenericDataTimestamp(nsecs_t timestamp,
+     int32_t msgType, const sp<IMemory>& dataPtr) {
+     sp<hardware::ICameraClient> c = mRemoteCallback;
++    // Taken while mLock is still held, because the buffer-queue branch below
++    // must not take mLock again. It runs on the HAL's callback thread, and
++    // stopRecording() holds mLock across mHardware->stopRecording(), which on
++    // QCamera2 (msm8916) joins exactly that thread: QCameraChannel::stop() ->
++    // QCameraCmdThread::exit() -> pthread_join. Re-taking mLock here to release
++    // the frame deadlocked the two for good, with the camera wedged until
++    // minimediaservice restarted. The reference keeps the interface alive past
++    // a concurrent disconnect(); the HAL joins this thread before close().
++    // The release itself is queued rather than made here: see
++    // mFrameReleaseThread in CameraClient.h for the second deadlock that a
++    // release from inside this callback caused.
++    const bool bufferQueueMode = mVideoBufferQueueMode;
++    const sp<CameraHardwareInterface> hardware = mHardware;
+     mLock.unlock();
+-    if (msgType == CAMERA_MSG_VIDEO_FRAME && mVideoBufferQueueMode && dataPtr != nullptr) {
++    if (msgType == CAMERA_MSG_VIDEO_FRAME && bufferQueueMode && dataPtr != nullptr) {
+         copyFrameToVideoWindow(timestamp, dataPtr);
+-        Mutex::Autolock l(mLock);
+-        if (mHardware != 0) mHardware->releaseRecordingFrame(dataPtr);
++        if (hardware != 0) queueRecordingFrameRelease(hardware, dataPtr);
+         return;
+     }
+     if (c != 0 && dataPtr != nullptr) {
+@@ -1272,6 +1291,49 @@ status_t CameraClient::setVideoTarget(const sp<SurfaceType>& target) {
+     return NO_ERROR;
+ }
+ 
++void CameraClient::queueRecordingFrameRelease(const sp<CameraHardwareInterface>& hardware,
++        const sp<IMemory>& dataPtr) {
++    const std::lock_guard<std::mutex> l(mFrameReleaseLock);
++    if (mFrameReleaseStop) {
++        // Only after disconnect() began: the HAL is about to free its buffers anyway.
++        ALOGW("%s: recording frame after the device was released, not returned", __FUNCTION__);
++        return;
++    }
++    if (!mFrameReleaseThread.joinable()) {
++        mFrameReleaseThread = std::thread(&CameraClient::frameReleaseLoop, this);
++    }
++    mFrameReleaseQueue.emplace_back(hardware, dataPtr);
++    mFrameReleaseCond.notify_one();
++}
++
++void CameraClient::frameReleaseLoop() {
++    pthread_setname_np(pthread_self(), "CamFrameRelease");
++    std::unique_lock<std::mutex> l(mFrameReleaseLock);
++    for (;;) {
++        mFrameReleaseCond.wait(l, [this] {
++            return mFrameReleaseStop || !mFrameReleaseQueue.empty();
++        });
++        // Stopping still hands back everything that was queued first.
++        if (mFrameReleaseQueue.empty()) return;
++        std::pair<sp<CameraHardwareInterface>, sp<IMemory>> frame =
++                std::move(mFrameReleaseQueue.front());
++        mFrameReleaseQueue.pop_front();
++        l.unlock();
++        frame.first->releaseRecordingFrame(frame.second);
++        frame = {};  // drop the references outside the lock
++        l.lock();
++    }
++}
++
++void CameraClient::stopFrameReleaseThread() {
++    {
++        const std::lock_guard<std::mutex> l(mFrameReleaseLock);
++        mFrameReleaseStop = true;
++    }
++    mFrameReleaseCond.notify_all();
++    if (mFrameReleaseThread.joinable()) mFrameReleaseThread.join();
++}
++
+ void CameraClient::disconnectVideoWindow() {
+     Mutex::Autolock l(mVideoWindowLock);
+     if (mVideoWindow != 0) {
+diff --git a/services/camera/libcameraservice/api1/CameraClient.h b/services/camera/libcameraservice/api1/CameraClient.h
+index 1686278274..c37fd2b703 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.h
++++ b/services/camera/libcameraservice/api1/CameraClient.h
+@@ -22,6 +22,12 @@
+ #ifndef ANDROID_SERVERS_CAMERA_CAMERACLIENT_H
+ #define ANDROID_SERVERS_CAMERA_CAMERACLIENT_H
+ 
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <utility>
++
+ #include <gui/Flags.h>
+ #include "CameraService.h"
+ 
+@@ -183,6 +189,24 @@ private:
+     void                            disconnectVideoWindow();
+     void                            copyFrameToVideoWindow(nsecs_t timestamp, const sp<IMemory>& dataPtr);
+ 
++    // Buffer-queue recording frames go back to the HAL from this thread, never from inside the
++    // HAL's data callback. The callback is a HIDL call from the provider's callback thread, so a
++    // release made inside it is a nested call that binder runs on that same provider thread - and
++    // on QCamera2 (msm8916) stopRecording() holds the HIDL CameraDevice's lock while it joins that
++    // thread, so the nested release waited for the lock and the join waited for the release.
++    // Queued here, the callback returns at once, the join completes and the release follows.
++    std::mutex                      mFrameReleaseLock;  // guards the three below
++    std::condition_variable         mFrameReleaseCond;
++    std::deque<std::pair<sp<CameraHardwareInterface>, sp<IMemory>>> mFrameReleaseQueue;
++    bool                            mFrameReleaseStop = false;
++    std::thread                     mFrameReleaseThread; // started on the first frame, see below
++    void                            queueRecordingFrameRelease(
++                                            const sp<CameraHardwareInterface>& hardware,
++                                            const sp<IMemory>& dataPtr);
++    void                            frameReleaseLoop();
++    // Releases what is queued, then ends the thread. Called before mHardware->release().
++    void                            stopFrameReleaseThread();
++
+     // If the user want us to return a copy of the preview frame (instead
+     // of the original one), we allocate mPreviewBuffer and reuse it if possible.
+     sp<MemoryHeapBase>              mPreviewBuffer;
