@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herman van Hazendonk <github.com@herrie.org>
+Date: Mon, 16 Nov 2026 08:49:16 +0100
+Subject: [PATCH] (halium) libsysutils: skip non-kernel uevent messages quietly
+
+uevent_kernel_recv() drops any netlink message that did not come from
+the kernel and returns -1 with errno EIO. Under Halium, udev on the host
+multicasts its own messages on the uevent netlink socket, so every
+NetlinkListener in the container (vold, netd and vendor daemons) hits
+this on every device event and logs
+
+  NetlinkListener: recvmsg failed (I/O error)
+
+On a MediaTek phone that is a steady stream, bursts with every uevent,
+and it pushes everything else out of the kernel log ring buffer.
+
+Treat EIO as a skipped message, as init's ReadUevent already does
+(0006-halium-init-ignore-non-kernel-messages-in-ReadUevent), and keep
+logging every other receive error.
+
+Change-Id: I4d3edadb97c39f6882fc570656066d7f3a8d181a
+Signed-off-by: Herman van Hazendonk <github.com@herrie.org>
+---
+ libsysutils/src/NetlinkListener.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/libsysutils/src/NetlinkListener.cpp b/libsysutils/src/NetlinkListener.cpp
+index 3dc2e4355c..361c8787f8 100644
+--- a/libsysutils/src/NetlinkListener.cpp
++++ b/libsysutils/src/NetlinkListener.cpp
+@@ -57,6 +57,13 @@ bool NetlinkListener::onDataAvailable(SocketClient *cli)
+     count = TEMP_FAILURE_RETRY(uevent_kernel_recv(socket,
+             mBuffer, sizeof(mBuffer), require_group, &uid));
+     if (count < 0) {
++        if (errno == EIO) {
++            // uevent_kernel_recv() dropped a message that did not come from
++            // the kernel. Under Halium, udev on the host multicasts its own
++            // messages on the uevent netlink socket, so this happens on every
++            // device event; skip it quietly and keep listening.
++            return true;
++        }
+ #ifdef __ANDROID_RECOVERY__
+         SLOGW("recvmsg failed (%s)", strerror(errno));
+ #else
