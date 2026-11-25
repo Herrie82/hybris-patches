@@ -150,7 +150,7 @@ index 0000000000..8b77bcb9ac
 +++ b/services/camera/libcameraservice/api1/ExynosVideoBuffer.cpp
 @@ -0,0 +1,109 @@
 +/*
-+ * Copyright (C) 2026 The LuneOS Project
++ * Copyright (C) 2026 Herman van Hazendonk <github.com@herrie.org>
 + *
 + * Licensed under the Apache License, Version 2.0 (the "License");
 + * you may not use this file except in compliance with the License.
@@ -265,7 +265,7 @@ index 0000000000..0c968f3993
 +++ b/services/camera/libcameraservice/api1/ExynosVideoBuffer.h
 @@ -0,0 +1,57 @@
 +/*
-+ * Copyright (C) 2026 The LuneOS Project
++ * Copyright (C) 2026 Herman van Hazendonk <github.com@herrie.org>
 + *
 + * Licensed under the Apache License, Version 2.0 (the "License");
 + * you may not use this file except in compliance with the License.
@@ -348,7 +348,7 @@ index 0000000000..0a15d33bb8
 +++ b/services/camera/libcameraservice/tests/ExynosVideoBufferTest.cpp
 @@ -0,0 +1,156 @@
 +/*
-+ * Copyright (C) 2026 The LuneOS Project
++ * Copyright (C) 2026 Herman van Hazendonk <github.com@herrie.org>
 + *
 + * Licensed under the Apache License, Version 2.0 (the "License");
 + * you may not use this file except in compliance with the License.
